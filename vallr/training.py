@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from config import WarmupScheduler
 from Data.dataset import VideoDataset
-from Models.ML_VALLR import ML_VALLR
+# from Models.ML_VALLR import ML_VALLR
 from Models.VALLR import VALLR
 from transformers import VideoMAEConfig, Wav2Vec2Config
 
@@ -284,11 +284,11 @@ def _build_model(version: str, phoneme_vocab: Dict[str, int]) -> nn.Module:
             wav2vec_config=wav2vec_config,
             adapter_dim=256,
         )
-    elif version == "V2":
-        model = ML_VALLR(
-            adapter_dim=256,
-            num_classes=len(phoneme_vocab),
-        )
+    # elif version == "V2":
+    #     model = ML_VALLR(
+    #         adapter_dim=256,
+    #         num_classes=len(phoneme_vocab),
+    #     )
     else:
         raise ValueError(f"Unsupported model version: {version}")
 
