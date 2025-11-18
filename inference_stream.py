@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import argparse
-from typing import Generator, List, Mapping, Optional, Sequence
+from typing import Generator, List, Mapping, Optional, Sequence, Tuple
 
+import cv2
 import numpy as np
 import torch
 from decord import VideoReader, cpu
@@ -21,6 +22,7 @@ def iter_video_chunks(
     chunk_size: int,
     stride: Optional[int] = None,
     num_threads: int = 4,
+    frame_size: Tuple[int, int] = (224, 224),
 ) -> Generator[Tensor, None, None]:
     """Yield sliding-window chunks of frames from ``video_path`` prepared for inference.
 
@@ -49,7 +51,7 @@ def iter_video_chunks(
     frames: List[np.ndarray] = []
     for idx in range(total_frames):
         frame = video_reader[idx].asnumpy()
-        frames.append(np.transpose(frame, (2, 0, 1)))
+        frames.append(preprocess_frame(frame, frame_size))
 
     # Always include the final window so that the tail of the clip is covered.
     window_starts = list(range(0, max(total_frames - chunk_size + 1, 1), stride))
@@ -65,6 +67,23 @@ def iter_video_chunks(
         chunk_np = np.stack(window_frames)
         chunk_tensor = torch.from_numpy(chunk_np).unsqueeze(0).float()
         yield chunk_tensor
+
+
+def preprocess_frame(frame: np.ndarray, frame_size: Tuple[int, int]) -> np.ndarray:
+    """Apply VALLR V1 preprocessing to a single frame.
+
+    Steps mirror the training/inference path: resize to 224x224, convert to float
+    in [0, 1], and normalize using VideoMAE-style statistics.
+    """
+
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+    resized = cv2.resize(frame, frame_size, interpolation=cv2.INTER_AREA)
+    float_frame = resized.astype(np.float32) / 255.0
+    normalized = (float_frame - mean) / std
+    chw = np.transpose(normalized, (2, 0, 1))
+    return chw
 
 
 def decode_logits(
@@ -101,6 +120,42 @@ def translate_phonemes_with_llm(phonemes: Sequence[str]) -> str:
     raise NotImplementedError("LLM translation is not implemented. Integrate your LLM here.")
 
 
+def run_full_clip_inference(
+    model: torch.nn.Module,
+    video_path: str,
+    device: torch.device,
+    reverse_vocab: Mapping[int, str],
+    frame_size: Tuple[int, int],
+    debug: bool,
+) -> List[str]:
+    """Load the entire clip, run one forward pass, and decode phonemes."""
+
+    try:
+        video_reader = VideoReader(video_path, ctx=cpu(0), num_threads=4)
+    except Exception as exc:  # pylint: disable=broad-except
+        raise RuntimeError(f"Unable to open video '{video_path}': {exc}") from exc
+
+    frames: List[np.ndarray] = []
+    for idx in range(len(video_reader)):
+        frame = video_reader[idx].asnumpy()
+        frames.append(preprocess_frame(frame, frame_size))
+
+    if not frames:
+        raise RuntimeError(f"Video '{video_path}' does not contain any frames")
+
+    clip = torch.from_numpy(np.stack(frames)).unsqueeze(0).float().to(device)
+
+    with torch.no_grad():
+        logits, _ = model(clip)
+
+    if debug:
+        predicted_indices = torch.argmax(logits, dim=-1).squeeze(0).tolist()
+        print("Pred indices:", predicted_indices[:50])
+        print("Pred tokens:", [reverse_vocab.get(i) for i in predicted_indices[:50]])
+
+    return decode_logits(logits, reverse_vocab)
+
+
 def run_streaming_inference(
     model_path: str,
     model_version: str,
@@ -109,6 +164,9 @@ def run_streaming_inference(
     chunk_size: int,
     stride: int,
     translate: bool,
+    no_stream: bool,
+    debug: bool,
+    frame_size: Tuple[int, int],
 ) -> None:
     """Run streamed inference on ``video_path`` and print phoneme predictions."""
 
@@ -116,12 +174,32 @@ def run_streaming_inference(
     model = load_finetuned_model(model_path, device, model_version, phoneme_vocab)
     reverse_vocab = {value: key for key, value in phoneme_vocab.items()}
 
+    if no_stream:
+        phonemes = run_full_clip_inference(
+            model=model,
+            video_path=video_path,
+            device=device,
+            reverse_vocab=reverse_vocab,
+            frame_size=frame_size,
+            debug=debug,
+        )
+        print(f"Full clip: {' '.join(phonemes) if phonemes else '[no phonemes]'}")
+        return
+
     all_phoneme_sequences: List[List[str]] = []
 
     with torch.no_grad():
-        for chunk_tensor in iter_video_chunks(video_path, chunk_size, stride=stride):
+        for chunk_idx, chunk_tensor in enumerate(
+            iter_video_chunks(video_path, chunk_size, stride=stride, frame_size=frame_size), start=1
+        ):
             chunk_tensor = chunk_tensor.to(device)
             logits, _ = model(chunk_tensor)
+
+            if debug and chunk_idx == 1:
+                predicted_indices = torch.argmax(logits, dim=-1).squeeze(0).tolist()
+                print("Pred indices:", predicted_indices[:50])
+                print("Pred tokens:", [reverse_vocab.get(i) for i in predicted_indices[:50]])
+
             phoneme_sequence = decode_logits(logits, reverse_vocab)
             all_phoneme_sequences.append(phoneme_sequence)
 
@@ -156,18 +234,34 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--chunk-size",
         type=int,
         default=16,
-        help="Number of frames per inference pass",
+        help="Number of frames per inference pass (matches V1 training sequence length)",
     )
     parser.add_argument(
         "--stride",
         type=int,
         default=None,
-        help="Stride (in frames) between sliding windows; defaults to chunk size",
+        help="Stride (in frames) between sliding windows; defaults to chunk size (no overlap)",
     )
     parser.add_argument(
         "--translate",
         action="store_true",
         help="Attempt to translate phonemes into text using an LLM hook",
+    )
+    parser.add_argument(
+        "--no-stream",
+        action="store_true",
+        help="Disable streaming and run a single forward pass over the full clip",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print raw predicted indices and tokens for the first decoded output",
+    )
+    parser.add_argument(
+        "--frame-size",
+        type=int,
+        default=224,
+        help="Spatial resolution for preprocessing (height=width)",
     )
     return parser.parse_args(argv)
 
@@ -183,6 +277,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         chunk_size=args.chunk_size,
         stride=args.stride if args.stride is not None else args.chunk_size,
         translate=args.translate,
+        no_stream=args.no_stream,
+        debug=args.debug,
+        frame_size=(args.frame_size, args.frame_size),
     )
 
 
