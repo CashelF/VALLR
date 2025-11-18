@@ -37,7 +37,7 @@ def main() -> None:
         print("Inferences", run_inference(save_model_path, version, video_path, device, vocab))
     elif args.mode == "lora_overfit":
         print("Lora Overfit")
-        train_single_video_lora('train_phonemes.json', torch.device('cuda'))
+        train_single_video_lora('videos/train_phonemes.json', torch.device('cuda'))
     else:
         raise ValueError(f"Unsupported mode: {args.mode}")
 
