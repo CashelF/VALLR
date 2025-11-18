@@ -5,6 +5,7 @@ import torch
 from config import get_vocab, load_args
 from vallr.inference import run_inference
 from vallr.training import train
+from vallr.lora_overfit import train_single_video_lora
 
 
 def main() -> None:
@@ -34,6 +35,9 @@ def main() -> None:
         )
     elif args.mode == "infer":
         print("Inferences", run_inference(save_model_path, version, video_path, device, vocab))
+    elif args.mode == "lora_overfit":
+        print("Lora Overfit")
+        train_single_video_lora('train_phonemes.json', torch.device('cuda'))
     else:
         raise ValueError(f"Unsupported mode: {args.mode}")
 

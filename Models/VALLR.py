@@ -69,7 +69,7 @@ class VALLR(nn.Module):
         # Step 1: Extract features from VideoMAE
         videomae_outputs = self.videomae(video_inputs)
         video_features = videomae_outputs.last_hidden_state  # (batch_size, sequence_length, hidden_size)
-        print(f"Video features shape: {video_features.shape}")
+        # print(f"Video features shape: {video_features.shape}")
 
         # Step 2: Downsample the time dimension using Conv1D + Pooling
         # Convert (batch_size, seq_len, feature_dim) -> (batch_size, feature_dim, seq_len)
@@ -77,7 +77,7 @@ class VALLR(nn.Module):
 
         # Apply Conv1D and Pooling to reduce the sequence length
         downsampled_features = self.downsampling(video_features)  # (batch_size, adapter_dim, reduced_seq_len)
-        print(f"Downsampled features shape: {downsampled_features.shape}")
+        # print(f"Downsampled features shape: {downsampled_features.shape}")
 
         # Convert back to (batch_size, reduced_seq_len, adapter_dim)
         downsampled_features = downsampled_features.permute(0, 2, 1)
