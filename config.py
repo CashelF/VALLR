@@ -38,7 +38,7 @@ def load_args():
     # Training and inference parameters
     parser.add_argument('--epochs', type=int, default=10, help="Number of training epochs")
     parser.add_argument('--sample_size', type=float, default=1, help="Percentage of the dataset to use for training")
-    parser.add_argument('--mode', type=str, choices=['train', 'infer', 'WER'], help="Mode to run the script: 'train', 'infer' or 'WER'")
+    parser.add_argument('--mode', type=str, choices=['train', 'infer', 'WER', 'lora_overfit'], help="Mode to run the script: 'train', 'infer' or 'WER'")
     # parser.add_argument('--infer_video_path', type=str, help="Path to the video file for inference")
     # parser.add_argument('--num_classes', type=int, help="Number of classes for the classifier")
 
