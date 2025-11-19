@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from config import WarmupScheduler
-from Data.dataset import VideoDataset
+from data.dataset import VideoDataset
 # from Models.ML_VALLR import ML_VALLR
 from Models.VALLR import VALLR
 from transformers import VideoMAEConfig, Wav2Vec2Config

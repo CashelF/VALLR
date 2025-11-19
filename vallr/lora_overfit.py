@@ -17,14 +17,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
 from transformers import VideoMAEConfig, Wav2Vec2Config
-from Data.preprocess import preprocess_video_with_mouth_crop
+from data.preprocess import preprocess_video_with_mouth_crop
+from decord import VideoReader, cpu
+from data.face_cropper import FaceCropper
 from vallr.inference import load_finetuned_model
 
 from config import get_vocab
 from Models.VALLR import VALLR
-import cv2 
+import cv2
 
 
 Tensor = torch.Tensor
@@ -57,18 +58,15 @@ class LoRALinear(nn.Module):
     @property
     def weight(self) -> nn.Parameter:
         """Expose the frozen base weight for compatibility with F.linear calls."""
-
         return self.base.weight
 
     @property
     def bias(self) -> nn.Parameter | None:
         """Expose the frozen base bias for compatibility with F.linear calls."""
-
         return self.base.bias
 
     def reset_parameters(self) -> None:
-        # nn.init.kaiming_uniform_(self.lora_A.weight, a=5**0.5)
-        nn.init.zeros_(self.lora_A.weight)
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=5**0.5)
         nn.init.zeros_(self.lora_B.weight)
 
     def forward(self, x: Tensor) -> Tensor:  # type: ignore[override]
@@ -85,7 +83,6 @@ def _replace_linear_with_lora(module: nn.Module, rank: int, alpha: int) -> None:
 
 def apply_videomae_lora(videomae: nn.Module, rank: int = 8, alpha: int = 16) -> None:
     """Freeze VideoMAE and insert LoRA adapters into all linear submodules."""
-
     for param in videomae.parameters():
         param.requires_grad = False
     _replace_linear_with_lora(videomae, rank=rank, alpha=alpha)
@@ -106,7 +103,6 @@ class SingleVideoSample:
             phoneme_ids=list(payload["phoneme_ids"]),
             aligned_phonemes=list(payload["aligned_phonemes"]),
         )
-
 
 
 class SingleVideoPhonemeDataset(Dataset):
@@ -136,12 +132,6 @@ class SingleVideoPhonemeDataset(Dataset):
         self.min_conf = min_conf
         self.ema = ema
         self.model_selection = model_selection
-        self.transform = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Resize(self.frame_size, antialias=True),
-            ]
-        )
 
         self.video_frames, self.video_fps = self._load_and_preprocess_video(self.sample.video_path)
 
@@ -152,9 +142,11 @@ class SingleVideoPhonemeDataset(Dataset):
         return self.repeats
 
     def __getitem__(self, _: int) -> Tuple[Tensor, Tensor]:
+        # Get a random contiguous chunk of frames
         video_np, (t_start, t_end) = self._load_and_sample_video()
+
         # (T, H, W, C) -> (T, C, H, W)
-        video_tensor = torch.stack([self.transform(frame) for frame in video_np])
+        video_tensor = torch.from_numpy(video_np).permute(0, 3, 1, 2).float()
 
         # 1) take only phonemes overlapping this window
         label_ids = self._slice_targets_by_time(t_start, t_end)
@@ -164,20 +156,63 @@ class SingleVideoPhonemeDataset(Dataset):
         label_tensor = torch.tensor(label_ids, dtype=torch.long)
         return video_tensor, label_tensor
 
-
     def _load_and_preprocess_video(self, video_path: Path) -> Tuple[np.ndarray, float]:
-        return preprocess_video_with_mouth_crop(
-            video_path,
-            frame_size=self.frame_size,
-            target_fps=self.target_fps,
-            margin=self.margin,
-            min_conf=self.min_conf,
-            ema=self.ema,
-            model_selection=self.model_selection,
+        """
+        Load the video and apply *face* crops. Returns (T, H, W, C) uint8 and the effective FPS.
+        """
+        try:
+            vr = VideoReader(str(video_path), ctx=cpu(0), num_threads=1)
+        except Exception as e:
+            print(f"Error loading video: {video_path}. Error: {e}")
+            raise
+
+        # If you want to keep target_fps thinning, otherwise just step = 1
+        in_fps = float(vr.get_avg_fps()) or 30.0
+        step = 1
+        if self.target_fps:
+            step = max(1, int(round(in_fps / self.target_fps)))
+        effective_fps = in_fps / step
+
+        face_cropper = FaceCropper(
+            min_face_detector_confidence=0.5,
+            face_detector_model_selection="SHORT_RANGE",
+            landmark_detector_static_image_mode="STATIC_MODE",
+            min_landmark_detector_confidence=0.5,
         )
 
+        frames: List[np.ndarray] = []
+        for idx in range(0, len(vr), step):
+            frame = vr[idx].asnumpy()                        # H, W, C, BGR-ish
+            frame = cv2.resize(frame, self.frame_size)       # resize first
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            faces = face_cropper.get_faces(
+                frame, remove_background=False, correct_roll=True
+            )
+            if faces:
+                face = faces[0]
+                face = cv2.resize(face, self.frame_size)
+                frames.append(face)
+            else:
+                # fallback: just resized RGB frame
+                frames.append(frame)
+
+        if not frames:
+            raise RuntimeError(f"No frames extracted from {video_path}")
+
+        video_np = np.stack(frames, axis=0)  # (T, H, W, C), uint8
+        return video_np, effective_fps
+
+
     def _load_and_sample_video(self) -> Tuple[np.ndarray, Tuple[float, float]]:
-        video_np_full = self.video_frames
+        """
+        Take a random contiguous window with a fixed stride from the
+        preprocessed video, instead of evenly-spaced frames.
+
+        This keeps desired temporal sampling but ensures shapes/dtypes
+        match model expectations.
+        """
+        video_np_full = self.video_frames  # (T_full, H, W, C), uint8
         frame_count = len(video_np_full)
         fps = self.video_fps
 
@@ -187,19 +222,22 @@ class SingleVideoPhonemeDataset(Dataset):
             if frame_count < self.num_frames:
                 pad = np.full(self.num_frames - frame_count, frame_count - 1, dtype=int)
                 indices = np.concatenate([indices, pad])
-            start_idx = 0
+            start_idx = int(indices[0])
         else:
-            # Random contiguous window
-            start_idx = np.random.randint(0, frame_count - self.num_frames + 1)
-            indices = np.arange(start_idx, start_idx + self.num_frames)
+            # Random contiguous window with stride
+            stride = 2  # This roughly matches the "stride" that was used in training (0.1-0.3s in between each frame at 25fps)
+            max_start = max(0, frame_count - stride * self.num_frames)
+            start_idx = np.random.randint(0, max_start + 1)
+            indices = start_idx + stride * np.arange(self.num_frames)
 
         video_np = video_np_full[indices]
 
-        frame_start_t = start_idx / fps
-        frame_end_t = (start_idx + self.num_frames) / fps
+        # Time of first and last *included* frame (end as exclusive-ish)
+        frame_start_t = indices[0] / fps
+        frame_end_t = (indices[-1] + 1) / fps
 
         return video_np, (frame_start_t, frame_end_t)
-    
+
     def _slice_targets_by_time(self, t_start: float, t_end: float) -> List[int]:
         ids: List[int] = []
         for p in self.sample.aligned_phonemes:
@@ -213,15 +251,13 @@ class SingleVideoPhonemeDataset(Dataset):
 
         return ids
 
-
-    
     def _downsample_targets(self, phoneme_ids: List[int]) -> List[int]:
         if self.max_target_length is None or len(phoneme_ids) <= self.max_target_length:
             return phoneme_ids
 
         indices = np.linspace(0, len(phoneme_ids) - 1, self.max_target_length).astype(int)
         return [phoneme_ids[i] for i in indices]
-    
+
     def _save_debug_video(self, out_path: str) -> None:
         """Dump the preprocessed mouth-cropped video to an MP4 for inspection."""
         frames = self.video_frames  # (T, H, W, C), assumed RGB uint8 or float
@@ -246,7 +282,6 @@ class SingleVideoPhonemeDataset(Dataset):
         print(f"[debug] Saved preprocessed video to {out_path}")
 
 
-
 def collate_single_video(batch: Iterable[Tuple[Tensor, Tensor]]) -> Tuple[Tensor, List[Tensor]]:
     videos, labels = zip(*batch)
     stacked_videos = torch.stack(videos)
@@ -266,9 +301,8 @@ def build_lora_overfit_model(
     #     wav2vec_config=wav2vec_config,
     #     adapter_dim=256,
     # )
-    model = load_finetuned_model('VALLR.path', torch.device('cuda'), 'V1', phoneme_vocab)
-    # for name, p in model.named_parameters():
-    #     p.requires_grad = False
+    model = load_finetuned_model("VALLR.path", torch.device("cuda"), "V1", phoneme_vocab)
+
     apply_videomae_lora(model.videomae, rank=lora_rank, alpha=lora_alpha)
     return model
 
@@ -290,7 +324,7 @@ def train_single_video_lora(
         annotation_path=annotation_path,
         num_frames=num_frames,
         repeats=repeats,
-        max_target_length=num_frames // 2, # Encoder downsamples time by 2
+        max_target_length=num_frames // 2,  # Encoder downsamples time by 2
         # debug_save_path="debug_preprocessed_mouthcrop.mp4",
     )
     dataloader = DataLoader(
@@ -320,38 +354,41 @@ def train_single_video_lora(
             videos = videos.to(device).float()
             labels = [label.to(device) for label in labels]
 
-            # optimizer.zero_grad()
+            optimizer.zero_grad()
+
             logits, _ = model(videos)
             log_probs = logits.log_softmax(dim=-1).transpose(0, 1)
 
             batch_size_val = log_probs.size(1)
             input_lengths = torch.full(
-                size=(batch_size_val,), fill_value=log_probs.size(0), dtype=torch.long, device=device
+                size=(batch_size_val,),
+                fill_value=log_probs.size(0),
+                dtype=torch.long,
+                device=device,
             )
-            target_lengths = torch.tensor([label.size(0) for label in labels], dtype=torch.long, device=device)
+            target_lengths = torch.tensor(
+                [label.size(0) for label in labels], dtype=torch.long, device=device
+            )
 
             if input_lengths.min() < target_lengths.max():
                 print(
-                    f"Skipping batch: input lengths {input_lengths.min().item()} < target lengths {target_lengths.max().item()}"
+                    f"Skipping batch: input lengths {input_lengths.min().item()} "
+                    f"< target lengths {target_lengths.max().item()}"
                 )
                 continue
-            
-            with torch.no_grad():
-                # log_probs: (T, B, V)
-                pred_ids = log_probs.argmax(dim=-1)  # (T, B)
 
-                # Take the first item in the batch for inspection
+            # DEBUGGING BLOCK
+            with torch.no_grad():
+                pred_ids = log_probs.argmax(dim=-1)  # (T, B)
                 pred_seq_b0 = pred_ids[:, 0].detach().cpu().tolist()
                 target_seq_b0 = labels[0].detach().cpu().tolist()
 
-                # Build inverse vocab: id -> phoneme string
                 id2phoneme = {idx: ph for ph, idx in phoneme_vocab.items()}
                 blank_id = phoneme_vocab["<pad>"]
 
                 def ids_to_phonemes(seq):
                     return [id2phoneme.get(i, f"<unk:{i}>") for i in seq]
 
-                # Simple CTC-style collapse (remove repeats + blanks)
                 def ctc_collapse(seq, blank=blank_id):
                     out = []
                     prev = None
@@ -366,22 +403,21 @@ def train_single_video_lora(
 
                 collapsed_pred_b0 = ctc_collapse(pred_seq_b0)
 
-                # Map to phoneme strings
-                raw_pred_phonemes     = ids_to_phonemes(pred_seq_b0)
+                raw_pred_phonemes = ids_to_phonemes(pred_seq_b0)
                 collapsed_pred_phonemes = ids_to_phonemes(collapsed_pred_b0)
-                target_phonemes       = ids_to_phonemes(target_seq_b0)
+                target_phonemes = ids_to_phonemes(target_seq_b0)
 
-                print("\n=== DEBUG: batch 0 ===")
-                print("raw pred ids (per timestep):", pred_seq_b0)
-                print("raw pred phonemes:          ", raw_pred_phonemes)
-                print()
-                print("collapsed pred ids:         ", collapsed_pred_b0)
-                print("collapsed pred phonemes:    ", collapsed_pred_phonemes)
-                print()
-                print("target ids:                 ", target_seq_b0)
-                print("target phonemes:            ", target_phonemes)
-                print("======================\n")
-
+                # if epoch == 49: 
+                #     print("\n=== DEBUG: batch 0 ===")
+                #     print("raw pred ids (per timestep):", pred_seq_b0)
+                #     print("raw pred phonemes:          ", raw_pred_phonemes)
+                #     print()
+                #     print("collapsed pred ids:         ", collapsed_pred_b0)
+                #     print("collapsed pred phonemes:    ", collapsed_pred_phonemes)
+                #     print()
+                #     print("target ids:                 ", target_seq_b0)
+                #     print("target phonemes:            ", target_phonemes)
+                #     print("======================\n")
 
             loss = criterion(log_probs, torch.cat(labels), input_lengths, target_lengths)
             loss.backward()

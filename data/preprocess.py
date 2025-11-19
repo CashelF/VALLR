@@ -301,3 +301,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+# python -m data.preprocess --videos_root videos --videos_output videos_processed
