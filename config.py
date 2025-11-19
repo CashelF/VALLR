@@ -32,8 +32,8 @@ def load_args():
     # parser.add_argument('--dropout_rate', type=float, default=0.1, help="Dropout probability in the transformer")
 
     # Preprocessing
-    # parser.add_argument('--frame_size', type=int, default=224, help="Resize the input video frames to this resolution")
-    # parser.add_argument('--videos_output', type=str, help="Output directory for the preporcessed video dataset")
+    parser.add_argument('--frame_size', type=int, default=224, help="Resize the input video frames to this resolution")
+    parser.add_argument('--videos_output', type=str, help="Output directory for the preporcessed video dataset")
 
     # Training and inference parameters
     parser.add_argument('--epochs', type=int, default=10, help="Number of training epochs")
