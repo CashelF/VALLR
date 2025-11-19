@@ -10,8 +10,8 @@ from decord import VideoReader, cpu
 from tqdm import tqdm
 
 import sys
-sys.path.append('..')
-from face_cropper import FaceCropper
+# sys.path.append('..')
+from data.face_cropper import FaceCropper
 from config import load_args
 
 
