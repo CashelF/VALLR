@@ -184,7 +184,7 @@ class SingleVideoPhonemeDataset(Dataset):
         for idx in range(0, len(vr), step):
             frame = vr[idx].asnumpy()                        # H, W, C, BGR-ish
             frame = cv2.resize(frame, self.frame_size)       # resize first
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) # TODO: idk why this is here but i dont think it should be for voxceleb?
 
             faces = face_cropper.get_faces(
                 frame, remove_background=False, correct_roll=True
@@ -302,6 +302,8 @@ def build_lora_overfit_model(
     #     adapter_dim=256,
     # )
     model = load_finetuned_model("VALLR.path", torch.device("cuda"), "V1", phoneme_vocab)
+    # for param in model.parameters():
+    #     param.requires_grad = False
 
     apply_videomae_lora(model.videomae, rank=lora_rank, alpha=lora_alpha)
     return model
@@ -407,7 +409,7 @@ def train_single_video_lora(
                 collapsed_pred_phonemes = ids_to_phonemes(collapsed_pred_b0)
                 target_phonemes = ids_to_phonemes(target_seq_b0)
 
-                # if epoch == 49: 
+                # if epoch == 99: 
                 #     print("\n=== DEBUG: batch 0 ===")
                 #     print("raw pred ids (per timestep):", pred_seq_b0)
                 #     print("raw pred phonemes:          ", raw_pred_phonemes)
